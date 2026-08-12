@@ -41,7 +41,7 @@ DROP TABLE IF EXISTS global_settings CASCADE;
 DROP TABLE IF EXISTS strategy_blocks CASCADE;
 SQL
 
-psql "$DB_URL" -f "$ROOT/infra/init/002_v2_schema.sql"
-psql "$DB_URL" -f "$ROOT/infra/init/003_v2_seed.sql"
+psql "$DB_URL" -f "$ROOT/scripts/migrations/002_v2_schema.sql"
+psql "$DB_URL" -f "$ROOT/scripts/migrations/003_v2_seed.sql"
 
 echo "=== Cutover complete ==="
