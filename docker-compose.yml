@@ -1,0 +1,139 @@
+# =============================================================
+# FinBot v2 — Stack de produção (monorepo)
+# =============================================================
+
+x-common-env: &common-env
+  TZ: ${TZ:-America/Sao_Paulo}
+  NATS_URL: nats://crypto-nats:4222
+  DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@crypto-postgres:5432/${DB_NAME}
+  BINANCE_API_KEY: ${BINANCE_API_KEY}
+  BINANCE_API_SECRET: ${BINANCE_API_SECRET}
+  DRY_RUN: ${DRY_RUN:-false}
+
+services:
+  # --- Core ---
+  fb-core-exec:
+    build:
+      context: .
+      dockerfile: services/fb-core-exec/Dockerfile
+    container_name: fb-core-exec
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      MAX_POSITIONS: ${MAX_POSITIONS:-20}
+    networks:
+      - crypto-network
+
+  fb-core-monitor:
+    build:
+      context: .
+      dockerfile: services/fb-core-monitor/Dockerfile
+    container_name: fb-core-monitor
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      MONITOR_INTERVAL: ${MONITOR_INTERVAL:-10}
+      MAX_HOLD_HOURS: ${MAX_HOLD_HOURS:-12}
+    networks:
+      - crypto-network
+
+  fb-core-dashboard:
+    build:
+      context: .
+      dockerfile: services/fb-core-dashboard/Dockerfile
+    container_name: fb-core-dashboard
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+      MAX_HOLD_HOURS: ${MAX_HOLD_HOURS:-12}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - crypto-network
+
+  # --- Bloco Leme ---
+  fb-leme-scan:
+    build:
+      context: .
+      dockerfile: services/fb-leme-scan/Dockerfile
+    container_name: fb-leme-scan
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-900}
+    networks:
+      - crypto-network
+
+  fb-leme-engine:
+    build:
+      context: .
+      dockerfile: services/fb-leme-engine/Dockerfile
+    container_name: fb-leme-engine
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    volumes:
+      - ml_models:/app/models
+    networks:
+      - crypto-network
+
+  fb-leme-guardian:
+    build:
+      context: .
+      dockerfile: services/fb-leme-guardian/Dockerfile
+    container_name: fb-leme-guardian
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    networks:
+      - crypto-network
+
+  fb-leme-shadow:
+    build:
+      context: .
+      dockerfile: services/fb-leme-shadow/Dockerfile
+    container_name: fb-leme-shadow
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    volumes:
+      - ml_models:/app/models
+    networks:
+      - crypto-network
+
+  # --- ML (offline) ---
+  fb-ml-training:
+    build:
+      context: .
+      dockerfile: services/fb-ml-training/Dockerfile
+    container_name: fb-ml-training
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    volumes:
+      - ml_models:/app/models
+    networks:
+      - crypto-network
+
+  fb-ml-validation:
+    build:
+      context: .
+      dockerfile: services/fb-ml-validation/Dockerfile
+    container_name: fb-ml-validation
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    volumes:
+      - ml_models:/app/models
+    networks:
+      - crypto-network
+
+networks:
+  crypto-network:
+    external: true
+
+volumes:
+  ml_models:
+    name: crypto_ml_models

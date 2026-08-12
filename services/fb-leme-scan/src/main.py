@@ -1,0 +1,242 @@
+import asyncio
+import logging
+import os
+import json
+import time
+import ccxt
+import nats
+from nats.js.api import DiscardPolicy, StreamConfig
+from nats.js.errors import NotFoundError
+from datetime import datetime
+import pandas as pd
+
+# Configuração de Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("fb-leme-scan")
+
+# Configurações via Ambiente
+NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
+UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 3600))  # 1 hora
+MIN_VOLUME_USDT = int(os.getenv("MIN_VOLUME_USDT", 10_000_000))
+TOP_N = int(os.getenv("TOP_N", 20))
+NATS_RECONNECT_WAIT = 5  # segundos
+BTC_SMA_PERIOD = int(os.getenv("BTC_SMA_PERIOD", "12"))  # periodos de 1h (~12h)
+# Retenção do stream PIPELINE: eventos são efêmeros (PostgreSQL guarda histórico).
+NATS_STREAM_MAX_AGE_HOURS = int(os.getenv("NATS_STREAM_MAX_AGE_HOURS", "48"))
+NATS_STREAM_MAX_BYTES = int(os.getenv("NATS_STREAM_MAX_BYTES", str(256 * 1024 * 1024)))
+
+PIPELINE_SUBJECTS = ["leme.>", "market.>", "strategies.>", "trade.>", "risk.>", "ml.>"]
+
+# Stablecoins para ignorar na seleção
+STABLECOINS = {"USDC", "FDUSD", "TUSD", "USDP", "BUSD", "DAI", "USD1", "RLUSD", "USDD", "FRAX"}
+FIAT_CURRENCIES = {"EUR", "GBP", "AUD", "BRL", "TRY", "PLN", "RON", "UAH", "ZAR", "NGN"}
+
+async def get_btc_trend():
+    """Busca BTC 1h, calcula SMA e retorna bull/bear/neutral."""
+    exchange = ccxt.binance({'enableRateLimit': True})
+    try:
+        ohlcv = await asyncio.to_thread(exchange.fetch_ohlcv, 'BTC/USDT', '1h', limit=BTC_SMA_PERIOD + 10)
+        if not ohlcv or len(ohlcv) < BTC_SMA_PERIOD:
+            return "neutral"
+        closes = [c[4] for c in ohlcv]
+        sma = sum(closes[-BTC_SMA_PERIOD:]) / BTC_SMA_PERIOD
+        current = closes[-1]
+        if current > sma * 1.01:
+            return "bull"
+        elif current < sma * 0.99:
+            return "bear"
+        return "neutral"
+    except Exception as e:
+        logger.error(f"Erro ao buscar trend BTC: {e}")
+        return "neutral"
+
+
+async def get_market_data():
+    """Busca dados da Binance e filtra ativos por liquidez."""
+    exchange = ccxt.binance({'enableRateLimit': True})
+
+    try:
+        logger.info("Buscando tickers da Binance...")
+        tickers = await asyncio.to_thread(exchange.fetch_tickers)
+
+        data = []
+        for symbol, ticker in tickers.items():
+            if not symbol.endswith('/USDT'):
+                continue
+            
+            base_currency = symbol.split('/')[0]
+            if base_currency in STABLECOINS or base_currency in FIAT_CURRENCIES:
+                continue
+                
+            vol = ticker.get('quoteVolume')
+            last = ticker.get('last')
+            pct = ticker.get('percentage')
+            if vol is None or last is None:
+                continue
+            data.append({
+                'symbol': symbol,
+                'last': last,
+                'quoteVolume': vol,
+                'percentage': pct or 0.0,
+            })
+
+        df = pd.DataFrame(data)
+        if df.empty:
+            logger.warning("Nenhum par USDT encontrado.")
+            return []
+
+        # Filtro de Volume mínimo
+        df = df[df['quoteVolume'] >= MIN_VOLUME_USDT]
+
+        # Top N moedas mais líquidas
+        top_assets = df.sort_values(by='quoteVolume', ascending=False).head(TOP_N)
+
+        now = datetime.utcnow().isoformat()
+        selected = []
+        
+        for i, row in top_assets.reset_index().iterrows():
+            symbol = row['symbol']
+            # Classificação por Tier
+            if symbol in ['BTC/USDT', 'ETH/USDT']:
+                tier = "Major"
+            elif i < 10: # Top 10 excluindo Majors (simplificado)
+                tier = "Strong Alt"
+            else:
+                tier = "High Volatility"
+                
+            selected.append({
+                "symbol": symbol,
+                "tier": tier,
+                "volume_24h": row['quoteVolume'],
+                "last_price": row['last'],
+                "change_24h": row['percentage'],
+                "timestamp": now,
+            })
+
+        logger.info(f"Selecionados {len(selected)} ativos (de {len(data)} pares USDT).")
+        return selected
+
+    except Exception as e:
+        logger.error(f"Erro ao buscar dados da Binance: {e}")
+        return []
+
+
+def pipeline_stream_config() -> StreamConfig:
+    """Configura retenção automática — evita crescimento infinito no JetStream."""
+    return StreamConfig(
+        name="PIPELINE",
+        subjects=PIPELINE_SUBJECTS,
+        max_age=NATS_STREAM_MAX_AGE_HOURS * 3600,
+        max_bytes=NATS_STREAM_MAX_BYTES,
+        discard=DiscardPolicy.OLD,
+    )
+
+
+async def ensure_pipeline_stream(js):
+    """Cria ou atualiza o stream PIPELINE com política de retenção."""
+    config = pipeline_stream_config()
+    try:
+        await js.update_stream(config)
+        logger.info(
+            "Stream PIPELINE atualizado (max_age=%sh, max_bytes=%sMB, discard=old).",
+            NATS_STREAM_MAX_AGE_HOURS,
+            NATS_STREAM_MAX_BYTES // (1024 * 1024),
+        )
+    except Exception:
+        await js.add_stream(config)
+        logger.info(
+            "Stream PIPELINE criado (max_age=%sh, max_bytes=%sMB, discard=old).",
+            NATS_STREAM_MAX_AGE_HOURS,
+            NATS_STREAM_MAX_BYTES // (1024 * 1024),
+        )
+
+
+async def connect_nats():
+    """Conecta ao NATS com retry infinito."""
+    while True:
+        try:
+            nc = await nats.connect(NATS_URL)
+            js = nc.jetstream()
+            logger.info(f"Conectado ao NATS em {NATS_URL}")
+
+            await ensure_pipeline_stream(js)
+
+            # KV Stores
+            kv_market = await ensure_kv(js, 'market_cache')
+            kv_positions = await ensure_kv(js, 'active_positions')
+            logger.info("KV Stores prontas.")
+
+            return nc, js, kv_market, kv_positions
+
+        except Exception as e:
+            logger.error(f"Erro ao conectar NATS: {e} — retry em {NATS_RECONNECT_WAIT}s")
+            await asyncio.sleep(NATS_RECONNECT_WAIT)
+
+
+async def ensure_kv(js, bucket):
+    """Cria KV bucket se não existir, senão apenas acessa."""
+    try:
+        return await js.create_key_value(bucket=bucket)
+    except Exception:
+        return await js.key_value(bucket=bucket)
+
+
+async def main():
+    nc, js, kv_market, kv_positions = await connect_nats()
+
+    while True:
+        start_time = time.time()
+
+        # Reconectar se necessário
+        if nc.is_closed:
+            logger.warning("Conexão NATS perdida, reconectando...")
+            nc, js, kv_market, kv_positions = await connect_nats()
+
+        # 1. Buscar trend do BTC
+        btc_trend = await get_btc_trend()
+
+        # 2. Buscar dados
+        assets = await get_market_data()
+
+        if assets:
+            # 2. Filtrar ativos que já têm posição aberta
+            filtered_assets = []
+            for asset in assets:
+                kv_key = asset['symbol'].replace('/', '_').replace('.', '_')
+                try:
+                    await kv_positions.get(kv_key)
+                    logger.debug(f"Ativo {asset['symbol']} ignorado (posição ativa).")
+                except NotFoundError:
+                    filtered_assets.append(asset)
+                except Exception as e:
+                    logger.warning(f"Erro ao checar posição de {asset['symbol']}: {e}")
+                    filtered_assets.append(asset)
+
+            if filtered_assets:
+                payload = json.dumps({
+                    "assets": filtered_assets,
+                    "btc_trend": btc_trend,
+                }).encode()
+
+                # 3. Publicar via JetStream
+                await js.publish("leme.universe", payload)
+
+                # 4. Cache para Dashboard
+                await kv_market.put("leme_universe", payload)
+
+                logger.info(f"Publicado {len(filtered_assets)} ativos em 'leme.universe'.")
+            else:
+                logger.info("Nenhum ativo novo (todos com posição ativa).")
+
+        # Aguardar intervalo
+        elapsed = time.time() - start_time
+        wait_time = max(0, UPDATE_INTERVAL - elapsed)
+        logger.info(f"Próxima atualização em {int(wait_time)}s...")
+        await asyncio.sleep(wait_time)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
