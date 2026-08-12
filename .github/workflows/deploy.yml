@@ -21,6 +21,7 @@ jobs:
           mkdir -p "$TARGET"
           rsync -a --delete \
             --exclude '.git' \
+            --exclude '.env' \
             --exclude 'node_modules' \
             --exclude '.venv' \
             --exclude 'scratch' \
