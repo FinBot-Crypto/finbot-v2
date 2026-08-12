@@ -1,0 +1,54 @@
+name: Deploy v2 Stack
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy FinBot v2
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync to VPS
+        run: |
+          set -e
+          TARGET="/root/crypto-bot"
+          mkdir -p "$TARGET"
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude '.venv' \
+            --exclude 'scratch' \
+            --exclude 'services/fb-ml-training/data' \
+            "$GITHUB_WORKSPACE/" "$TARGET/"
+          echo "Synced to $TARGET"
+
+      - name: Stop legacy stack
+        working-directory: /root/crypto-bot
+        run: |
+          set +e
+          LEGACY="fb-market-selection fb-strategy-ml fb-decision-engine fb-trade-decision \
+            fb-execution fb-execution-futures fb-position-management fb-analytics fb-web-dashboard"
+          for c in $LEGACY; do
+            docker stop "$c" 2>/dev/null && docker rm "$c" 2>/dev/null || true
+          done
+          set -e
+
+      - name: Build and start v2
+        working-directory: /root/crypto-bot
+        run: |
+          set -e
+          docker compose build --parallel
+          docker compose up -d
+          sleep 5
+          docker compose ps
+
+      - name: Health check
+        run: |
+          docker ps --filter name=fb-core --filter name=fb-leme --format '{{.Names}} {{.Status}}'
+          curl -sf http://localhost:8000/api/status || echo "Dashboard warming up..."
