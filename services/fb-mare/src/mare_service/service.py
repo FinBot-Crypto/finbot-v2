@@ -99,8 +99,11 @@ class MareService:
             durable="MARE_ENGINE_WORKER",
             cb=self.process_universe,
             manual_ack=True,
-            config=ConsumerConfig(ack_wait=self.config.cycle_timeout_sec),
-            pending_msgs_limit=4,
+            config=ConsumerConfig(
+                ack_wait=self.config.cycle_timeout_sec,
+                max_ack_pending=1,
+            ),
+            pending_msgs_limit=1,
         )
         while True:
             if self.nc.is_closed:
