@@ -26,22 +26,16 @@ jobs:
             --exclude '.venv' \
             --exclude 'scratch' \
             --exclude 'services/fb-ml-training/data' \
-            --exclude 'fb-mare' \
             "$GITHUB_WORKSPACE/" "$TARGET/"
           echo "Synced to $TARGET"
 
-      - name: Sync Maré service
+      - name: Apply database migrations
         working-directory: /root/crypto-bot
         run: |
           set -e
-          if [ -d fb-mare/.git ]; then
-            git -C fb-mare pull --ff-only
-          else
-            git clone https://github.com/FinBot-Crypto/fb-mare.git fb-mare
-          fi
           DB_USER=$(sed -n 's/^DB_USER=//p' .env)
           DB_NAME=$(sed -n 's/^DB_NAME=//p' .env)
-          docker exec -i crypto-postgres psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" < fb-mare/migrations/001_mare_schema.sql
+          docker exec -i crypto-postgres psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d "$DB_NAME" < scripts/migrations/006_mare_schema.sql
 
       - name: Stop legacy stack
         working-directory: /root/crypto-bot
@@ -60,8 +54,6 @@ jobs:
           set -e
           docker compose build --parallel
           docker compose up -d
-          docker compose -f docker-compose.yml -f fb-mare/docker-compose.mare.yml build fb-mare
-          docker compose -f docker-compose.yml -f fb-mare/docker-compose.mare.yml up -d fb-mare
           sleep 5
           docker compose ps
 

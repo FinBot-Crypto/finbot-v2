@@ -103,6 +103,26 @@ services:
     networks:
       - crypto-network
 
+  # --- Bloco Maré ---
+  fb-mare:
+    build:
+      context: .
+      dockerfile: services/fb-mare/Dockerfile
+    container_name: fb-mare
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      MARE_UNIVERSE_SUBJECT: ${MARE_UNIVERSE_SUBJECT:-leme.universe}
+      MARE_LIVE_ORDERS_ENABLED: ${MARE_LIVE_ORDERS_ENABLED:-false}
+      MARE_NOTIONAL_USDT: ${MARE_NOTIONAL_USDT:-10}
+      MARE_MIN_SCORE: ${MARE_MIN_SCORE:-0.65}
+      MARE_TIDE_TIMEFRAME: ${MARE_TIDE_TIMEFRAME:-4h}
+      MARE_WAVE_TIMEFRAME: ${MARE_WAVE_TIMEFRAME:-1h}
+      MARE_RIPPLE_TIMEFRAME: ${MARE_RIPPLE_TIMEFRAME:-15m}
+      MARE_MAX_ASSETS: ${MARE_MAX_ASSETS:-20}
+    networks:
+      - crypto-network
+
   # --- ML (offline) ---
   fb-ml-training:
     build:
